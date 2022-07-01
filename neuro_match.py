@@ -1,6 +1,7 @@
 """Defines all graph embedding models"""
 from functools import reduce
 import random
+import logging
 
 import networkx as nx
 import numpy as np
@@ -69,15 +70,16 @@ class OrderEmbedder(pl.LightningModule):
         out = self(batch)
         #print(out)
         loss = self.criterion(out, batch.y)
-
+        #print(out[0],out[1])
         opt.zero_grad()
         self.manual_backward(loss)
         opt.step()
 
         with torch.no_grad():
             pred = self.predict(out)
-        
+        print(pred)
         pred = self.clf_model(pred.unsqueeze(1))
+        print(pred)
         criterion = nn.NLLLoss()
         clf_loss = criterion(pred, batch.y)
         
@@ -112,7 +114,7 @@ class OrderEmbedder(pl.LightningModule):
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.parameters(), lr=self.lr)
-        clf_opt = torch.optim.Adam(self.clf_model.parameters(), lr=self.lr)
+        clf_opt = torch.optim.Adam(self.clf_model.parameters(), lr=self.clf_lr)
         return opt, clf_opt
 
     def predict(self, pred):
