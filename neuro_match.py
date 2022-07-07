@@ -77,9 +77,7 @@ class OrderEmbedder(pl.LightningModule):
 
         with torch.no_grad():
             pred = self.predict(out)
-        print(pred)
         pred = self.clf_model(pred.unsqueeze(1))
-        print(pred)
         criterion = nn.NLLLoss()
         clf_loss = criterion(pred, batch.y)
         
@@ -105,6 +103,7 @@ class OrderEmbedder(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         out = self(batch)
         pred = self.predict(out)
+        pred = self.clf_model(pred.unsqueeze(1))
 
         self.log("val acc", self.val_acc(pred, batch.y))
 
@@ -151,7 +150,7 @@ class OrderEmbedder(pl.LightningModule):
         return relation_loss
 
 class SkipLastGNN(nn.Module):
-    def __init__(self,num_layers, input_dim, hidden_dim, output_dim, dropout = 0.5, skip = "learnable", conv_type = "GCN"):
+    def __init__(self,num_layers, input_dim, hidden_dim, output_dim, dropout = 0.5, skip = "learnable", conv_type = "GIN"):
         super(SkipLastGNN, self).__init__()
         self.dropout = dropout
         self.n_layers = num_layers
