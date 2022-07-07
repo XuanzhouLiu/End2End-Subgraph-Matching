@@ -8,164 +8,135 @@ from torch_geometric.data import Data, Batch
 import pytorch_lightning as pl
 import torchmetrics
 
+
+
+
 class ISONET(pl.LightningModule):
-  def __init__(self, input_dim, node_hidden_dim, input_edge_dim, edge_hidden_dim, prop_layers = 2, node_layers = 2, edge_layers = 2,\
-    lr = 0.01, **kwargs):
-      """
-      """
-      super(ISONET, self).__init__()
-      self.config = kwargs
-      self.input_dim = input_dim
-      self.edge_dim = input_edge_dim
+    def __init__(self, input_dim, **kwargs):
+        """
+        """
+        super(ISONET, self).__init__()
+        self.config = kwargs
+        self.input_dim = input_dim
+        self.build_masking_utility()
+        self.build_layers()
+        self.diagnostic_mode = False
+        
+    def build_masking_utility(self):
+        self.max_set_size = self.av.MAX_EDGES
+        #this mask pattern sets bottom last few rows to 0 based on padding needs
+        self.graph_size_to_mask_map = [torch.cat((torch.tensor([1]).repeat(x,1).repeat(1,self.av.transform_dim), \
+        torch.tensor([0]).repeat(self.max_set_size-x,1).repeat(1,self.av.transform_dim))) for x in range(0,self.max_set_size+1)]
+        # Mask pattern sets top left (k)*(k) square to 1 inside arrays of size n*n. Rest elements are 0
+        self.set_size_to_mask_map = [torch.cat((torch.repeat_interleave(torch.tensor([1,0]),torch.tensor([x,self.max_set_size-x])).repeat(x,1),
+                             torch.repeat_interleave(torch.tensor([1,0]),torch.tensor([0,self.max_set_size])).repeat(self.max_set_size-x,1)))
+                             for x in range(0,self.max_set_size+1)]
 
-      self.node_hidden_dim = node_hidden_dim
-      self.edge_hidden_dim = edge_hidden_dim
+        
+    def fetch_edge_counts(self,to_idx,from_idx,graph_idx,num_graphs):
+        #HACK - since I'm not storing edge sizes of each graph (only storing node sizes)
+        #and no. of nodes is not equal to no. of edges
+        #so a hack to obtain no of edges in each graph from available info
+        tt = unsorted_segment_sum(cudavar(self.av,torch.ones(len(to_idx))), to_idx, len(graph_idx))
+        tt1 = unsorted_segment_sum(cudavar(self.av,torch.ones(len(from_idx))), from_idx, len(graph_idx))
+        edge_counts = unsorted_segment_sum(tt, graph_idx, num_graphs)
+        edge_counts1 = unsorted_segment_sum(tt1, graph_idx, num_graphs)
+        assert(edge_counts == edge_counts1).all()
+        assert(sum(edge_counts)== len(to_idx))
+        return list(map(int,edge_counts.tolist()))
 
-      self.node_layers = node_layers
-      self.edge_layers = edge_layers
-      self.prop_layers = prop_layers
-      self.MAX_EDGES = 1000
-      self.lr = lr
-      
-      self.build_masking_utility()
-      self.build_layers()
-      self.diagnostic_mode = False
-      
-  def build_masking_utility(self):
-      self.max_set_size = self.MAX_EDGES
-      #this mask pattern sets bottom last few rows to 0 based on padding needs
-      self.graph_size_to_mask_map = [torch.cat((torch.tensor([1]).repeat(x,1).repeat(1,self.edge_hidden_dim), \
-      torch.tensor([0]).repeat(self.max_set_size-x,1).repeat(1,self.edge_hidden_dim))) for x in range(0,self.max_set_size+1)]
-      # Mask pattern sets top left (k)*(k) square to 1 inside arrays of size n*n. Rest elements are 0
-      self.set_size_to_mask_map = [torch.cat((torch.repeat_interleave(torch.tensor([1,0]),torch.tensor([x,self.max_set_size-x])).repeat(x,1),
-                            torch.repeat_interleave(torch.tensor([1,0]),torch.tensor([0,self.max_set_size])).repeat(self.max_set_size-x,1)))
-                            for x in range(0,self.max_set_size+1)]
+    def build_layers(self):
 
-      
-  def fetch_edge_counts(self, to_idx, from_idx, graph_idx, num_graphs):
-      #HACK - since I'm not storing edge sizes of each graph (only storing node sizes)
-      #and no. of nodes is not equal to no. of edges
-      #so a hack to obtain no of edges in each graph from available info
-      tt = unsorted_segment_sum(torch.ones(len(to_idx)).to(self.device), to_idx, len(graph_idx))
-      tt1 = unsorted_segment_sum(torch.ones(len(from_idx)).to(self.device), from_idx, len(graph_idx))
-      edge_counts = unsorted_segment_sum(tt, graph_idx, num_graphs)
-      edge_counts1 = unsorted_segment_sum(tt1, graph_idx, num_graphs)
-      assert(edge_counts == edge_counts1).all()
-      assert(sum(edge_counts)== len(to_idx))
-      return list(map(int,edge_counts.tolist()))
-
-  def build_layers(self):
-
-      self.encoder = GraphEncoder(self.input_dim, self.edge_dim, [self.node_hidden_dim]*self.node_layers, [self.edge_hidden_dim]*self.edge_layers)
-      self.prop_layer = GraphPropLayer(self.node_hidden_dim, [self.edge_hidden_dim]*self.edge_layers, [self.node_hidden_dim]*self.node_layers)
-      
-      #NOTE:FILTERS_3 is 10 for now - hardcoded into config
-      self.fc_transform1 = nn.Linear(self.edge_hidden_dim, self.edge_hidden_dim)
-      self.relu1 = nn.ReLU()
-      self.fc_transform2 = nn.Linear(self.edge_hidden_dim, self.edge_hidden_dim)
-      
-      #self.edge_score_fc = nn.Linear(self.prop_layer._message_net[-1].out_features, 1)
-      
-  def get_graph(self, batch):
-      node_features = torch.cat([batch.x_t,batch.x_s], dim=0)
-      if hasattr(batch, "edge_feature_t"):
-        edge_features = torch.cat([batch.edge_feature_t,batch.edge_feature_s]).to(self.device)
-      else:
-        edge_features = torch.ones([batch.edge_index_t.size(1)+ batch.edge_index_s.size(1), self.edge_dim]).to(self.device)
-      edge_index = torch.cat([batch.edge_index_t, batch.edge_index_s + len(batch.x_t)], dim=1)
-      from_idx = edge_index[0]
-      to_idx = edge_index[1]
-      graph_idx = torch.cat([batch.x_t_batch, len(batch.t_nodes) + batch.x_s_batch])
-      return node_features, edge_features, from_idx, to_idx, graph_idx    
-  
-
-  def forward(self, batch):
-      """
-      """
-      node_features, edge_features, from_idx, to_idx, graph_idx = self.get_graph(batch)
-  
-      #先编码节点和边信息
-      node_features_enc, edge_features_enc = self.encoder(node_features, edge_features)
-
-      #多次传播得到更新后的节点特征
-      for i in range(self.prop_layers) :
-          #node_feature_enc = self.prop_layer(node_features_enc, from_idx, to_idx,edge_features_enc)
-          node_features_enc = self.prop_layer(node_features_enc, from_idx, to_idx, edge_features_enc)
-      
-      source_node_enc = node_features_enc[from_idx]
-      dest_node_enc  = node_features_enc[to_idx]
-      forward_edge_input = torch.cat((source_node_enc,dest_node_enc,edge_features_enc),dim=-1)
-      backward_edge_input = torch.cat((dest_node_enc,source_node_enc,edge_features_enc),dim=-1)
-
-      #再编码边信息
-      forward_edge_msg = self.prop_layer._message_net(forward_edge_input)
-      backward_edge_msg = self.prop_layer._reverse_message_net(backward_edge_input)
-      edge_features_enc = forward_edge_msg + backward_edge_msg
-      
-      edge_counts  = self.fetch_edge_counts(to_idx,from_idx,graph_idx,2*batch.num_graphs)
-      qgraph_edge_sizes = torch.tensor(edge_counts[0:len(batch.s_nodes)])
-      cgraph_edge_sizes = torch.tensor(edge_counts[len(batch.s_nodes):])
-
-      edge_feature_enc_split = torch.split(edge_features_enc, edge_counts, dim=0)
-      edge_feature_enc_query = edge_feature_enc_split[0:len(batch.s_nodes)]
-      edge_feature_enc_corpus = edge_feature_enc_split[len(batch.s_nodes):]  
-      
-      
-      stacked_qedge_emb = torch.stack([F.pad(x, pad=(0,0,0,self.max_set_size-x.shape[0])) \
-                                        for x in edge_feature_enc_query])
-      stacked_cedge_emb = torch.stack([F.pad(x, pad=(0,0,0,self.max_set_size-x.shape[0])) \
-                                        for x in edge_feature_enc_corpus])
-
-
-      transformed_qedge_emb = self.fc_transform2(self.relu1(self.fc_transform1(stacked_qedge_emb)))
-      transformed_cedge_emb = self.fc_transform2(self.relu1(self.fc_transform1(stacked_cedge_emb)))
-      #由于padding了边，所以需要把这些边去掉
-      qgraph_mask = torch.stack([self.graph_size_to_mask_map[i] for i in qgraph_edge_sizes])
-      cgraph_mask = torch.stack([self.graph_size_to_mask_map[i] for i in cgraph_edge_sizes])
-      masked_qedge_emb = torch.mul(qgraph_mask.to(transformed_qedge_emb.device),transformed_qedge_emb)
-      masked_cedge_emb = torch.mul(cgraph_mask.to(transformed_qedge_emb.device),transformed_cedge_emb)
-      #三维，batch,edge,dim
-      sinkhorn_input = torch.matmul(masked_qedge_emb,masked_cedge_emb.permute(0,2,1))
-      transport_plan = pytorch_sinkhorn_iters(sinkhorn_input)
-
-      if self.diagnostic_mode:
-          return transport_plan
-
-      scores = -torch.sum(torch.maximum(stacked_qedge_emb - transport_plan@stacked_cedge_emb,\
-            torch.tensor([0]).to(stacked_qedge_emb.device)),\
-          dim=(1,2))
-      
-      return scores
+        self.encoder = GraphEncoder(**self.config['encoder'])
+        prop_config = self.config['graph_embedding_net'].copy()
+        prop_config.pop('n_prop_layers',None)
+        prop_config.pop('share_prop_params',None)
+        self.prop_layer = GraphPropLayer(**prop_config)
+        
+        #NOTE:FILTERS_3 is 10 for now - hardcoded into config
+        self.fc_transform1 = nn.Linear(2*self.av.filters_3, self.av.transform_dim)
+        self.relu1 = nn.ReLU()
+        self.fc_transform2 = nn.Linear(self.av.transform_dim, self.av.transform_dim)
+        
+        #self.edge_score_fc = nn.Linear(self.prop_layer._message_net[-1].out_features, 1)
+        
+    def get_graph(self, batch):
+        graph = batch
+        node_features = cudavar(self.av,torch.from_numpy(graph.node_features))
+        edge_features = cudavar(self.av,torch.from_numpy(graph.edge_features))
+        from_idx = cudavar(self.av,torch.from_numpy(graph.from_idx).long())
+        to_idx = cudavar(self.av,torch.from_numpy(graph.to_idx).long())
+        graph_idx = cudavar(self.av,torch.from_numpy(graph.graph_idx).long())
+        return node_features, edge_features, from_idx, to_idx, graph_idx    
     
-  def training_step(self, batch, batch_idx):
-    prediction = self(batch)
-      #Pairwise ranking loss
-    predPos = prediction[batch.y>0.5]
-    predNeg = prediction[batch.y<0.5]
-    losses = pairwise_ranking_loss_similarity(predPos.unsqueeze(1),predNeg.unsqueeze(1), 0.5)
-      #losses = torch.nn.functional.mse_loss(target, prediction,reduction="sum")
-    return losses
 
-  def validation_step(self, batch, batch_idx):
-    prediction = self(batch)
-    return prediction
+    def forward(self, batch_data,batch_data_sizes,batch_adj):
+        """
+        """
+        #a,b = zip(*batch_data_sizes)
+        #qgraph_sizes = cudavar(self.av,torch.tensor(a))
+        #cgraph_sizes = cudavar(self.av,torch.tensor(b))
+        #A
+        #a, b = zip(*batch_adj)
+        #q_adj = torch.stack(a)
+        #c_adj = torch.stack(b)
+        
 
-  def configure_optimizers(self):
-        opt = torch.optim.Adam(self.parameters(), lr=self.lr)
-        return opt
-def pairwise_ranking_loss_similarity(predPos, predNeg, margin):
+        node_features, edge_features, from_idx, to_idx, graph_idx = self.get_graph(batch_data)
     
-    n_1 = predPos.shape[0]
-    n_2 = predNeg.shape[0]
-    dim = predPos.shape[1]
+        #先编码节点和边信息
+        node_features_enc, edge_features_enc = self.encoder(node_features, edge_features)
 
-    expanded_1 = predPos.unsqueeze(1).expand(n_1, n_2, dim)
-    expanded_2 = predNeg.unsqueeze(0).expand(n_1, n_2, dim)
-    ell = margin + expanded_2 - expanded_1
-    hinge = torch.nn.ReLU()
-    loss = hinge(ell)
-    sum_loss =  torch.sum(loss,dim= [0, 1])
-    return sum_loss/(n_1*n_2)
+        #多次传播得到更新后的节点特征
+        for i in range(self.config['graph_embedding_net'] ['n_prop_layers']) :
+            #node_feature_enc = self.prop_layer(node_features_enc, from_idx, to_idx,edge_features_enc)
+            node_features_enc = self.prop_layer(node_features_enc, from_idx, to_idx,edge_features_enc)
+        
+        source_node_enc = node_features_enc[from_idx]
+        dest_node_enc  = node_features_enc[to_idx]
+        forward_edge_input = torch.cat((source_node_enc,dest_node_enc,edge_features_enc),dim=-1)
+        backward_edge_input = torch.cat((dest_node_enc,source_node_enc,edge_features_enc),dim=-1)
+
+        #再编码边信息
+        forward_edge_msg = self.prop_layer._message_net(forward_edge_input)
+        backward_edge_msg = self.prop_layer._reverse_message_net(backward_edge_input)
+        edge_features_enc = forward_edge_msg + backward_edge_msg
+        
+        edge_counts  = self.fetch_edge_counts(to_idx,from_idx,graph_idx,2*len(batch_data_sizes))
+        qgraph_edge_sizes = torch.tensor(edge_counts[0::2])
+        cgraph_edge_sizes = torch.tensor(edge_counts[1::2])
+
+        edge_feature_enc_split = torch.split(edge_features_enc, edge_counts, dim=0)
+        edge_feature_enc_query = edge_feature_enc_split[0::2]
+        edge_feature_enc_corpus = edge_feature_enc_split[1::2]  
+        
+        
+        stacked_qedge_emb = torch.stack([F.pad(x, pad=(0,0,0,self.max_set_size-x.shape[0])) \
+                                         for x in edge_feature_enc_query])
+        stacked_cedge_emb = torch.stack([F.pad(x, pad=(0,0,0,self.max_set_size-x.shape[0])) \
+                                         for x in edge_feature_enc_corpus])
+
+
+        transformed_qedge_emb = self.fc_transform2(self.relu1(self.fc_transform1(stacked_qedge_emb)))
+        transformed_cedge_emb = self.fc_transform2(self.relu1(self.fc_transform1(stacked_cedge_emb)))
+        #由于padding了边，所以需要把这些边去掉
+        qgraph_mask = cudavar(self.av,torch.stack([self.graph_size_to_mask_map[i] for i in qgraph_edge_sizes]))
+        cgraph_mask = cudavar(self.av,torch.stack([self.graph_size_to_mask_map[i] for i in cgraph_edge_sizes]))
+        masked_qedge_emb = torch.mul(qgraph_mask,transformed_qedge_emb)
+        masked_cedge_emb = torch.mul(cgraph_mask,transformed_cedge_emb)
+ 
+        sinkhorn_input = torch.matmul(masked_qedge_emb,masked_cedge_emb.permute(0,2,1))
+        transport_plan = pytorch_sinkhorn_iters(self.av,sinkhorn_input)
+ 
+        if self.diagnostic_mode:
+            return transport_plan
+
+        scores = -torch.sum(torch.maximum(stacked_qedge_emb - transport_plan@stacked_cedge_emb,\
+              cudavar(self.av,torch.tensor([0]))),\
+           dim=(1,2))
+        
+        return scores
+
 
 class GraphEncoder(nn.Module):
     """Encoder module that projects node and edge features to some embeddings."""
@@ -235,11 +206,11 @@ class GraphEncoder(nn.Module):
         if edge_features is None or self._edge_hidden_sizes is None:
             edge_outputs = edge_features
         else:
-            edge_outputs = self.MLP2(edge_features)
+            edge_outputs = self.MLP2(node_features)
 
         return node_outputs, edge_outputs
 
-class GraphPropLayer(pl.LightningModule):
+class GraphPropLayer(nn.Module):
     """Implementation of a graph propagation (message passing) layer."""
 
     def __init__(self,
@@ -295,7 +266,7 @@ class GraphPropLayer(pl.LightningModule):
 
     def build_model(self):
         layer = []
-        layer.append(nn.Linear(self._edge_hidden_sizes[0] + 2*self._node_hidden_sizes[0], self._edge_hidden_sizes[0]))
+        layer.append(nn.Linear(self._edge_hidden_sizes[0] + 1, self._edge_hidden_sizes[0]))
         for i in range(1, len(self._edge_hidden_sizes)):
             layer.append(nn.ReLU())
             layer.append(nn.Linear(self._edge_hidden_sizes[i - 1], self._edge_hidden_sizes[i]))
@@ -305,7 +276,7 @@ class GraphPropLayer(pl.LightningModule):
         if self._use_reverse_direction:
             if self._reverse_dir_param_different:
                 layer = []
-                layer.append(nn.Linear(self._edge_hidden_sizes[0] + 2*self._node_hidden_sizes[0], self._edge_hidden_sizes[0]))
+                layer.append(nn.Linear(self._edge_hidden_sizes[0] + 1, self._edge_hidden_sizes[0]))
                 for i in range(1, len(self._edge_hidden_sizes)):
                     layer.append(nn.ReLU())
                     layer.append(nn.Linear(self._edge_hidden_sizes[i - 1], self._edge_hidden_sizes[i]))
@@ -321,9 +292,9 @@ class GraphPropLayer(pl.LightningModule):
         else:
             layer = []
             if self._prop_type == 'embedding':
-                layer.append(nn.Linear(self._node_state_dim * 2, self._node_hidden_sizes[0]))
-            elif self._prop_type == 'matching':
                 layer.append(nn.Linear(self._node_state_dim * 3, self._node_hidden_sizes[0]))
+            elif self._prop_type == 'matching':
+                layer.append(nn.Linear(self._node_state_dim * 4, self._node_hidden_sizes[0]))
             for i in range(1, len(self._node_hidden_sizes)):
                 layer.append(nn.ReLU())
                 layer.append(nn.Linear(self._node_hidden_sizes[i - 1], self._node_hidden_sizes[i]))
@@ -345,7 +316,7 @@ class GraphPropLayer(pl.LightningModule):
             aggregated messages for each node.
         """
 
-        aggregated_messages = self.graph_prop_once(
+        aggregated_messages = graph_prop_once(
             node_states,
             from_idx,
             to_idx,
@@ -355,7 +326,7 @@ class GraphPropLayer(pl.LightningModule):
 
         # optionally compute message vectors in the reverse direction
         if self._use_reverse_direction:
-            reverse_aggregated_messages = self.graph_prop_once(
+            reverse_aggregated_messages = graph_prop_once(
                 node_states,
                 to_idx,
                 from_idx,
@@ -449,47 +420,48 @@ class GraphPropLayer(pl.LightningModule):
                                          [aggregated_messages],
                                          node_features=node_features)
 
-    def graph_prop_once(self, node_states,
-                        from_idx,
-                        to_idx,
-                        message_net,
-                        aggregation_module=None,
-                        edge_features=None):
-        """One round of propagation (message passing) in a graph.
 
-        Args:
-          node_states: [n_nodes, node_state_dim] float tensor, node state vectors, one
-            row for each node.
-          from_idx: [n_edges] int tensor, index of the from nodes.
-          to_idx: [n_edges] int tensor, index of the to nodes.
-          message_net: a network that maps concatenated edge inputs to message
-            vectors.
-          aggregation_module: a module that aggregates messages on edges to aggregated
-            messages for each node.  Should be a callable and can be called like the
-            following,
-            `aggregated_messages = aggregation_module(messages, to_idx, n_nodes)`,
-            where messages is [n_edges, edge_message_dim] tensor, to_idx is the index
-            of the to nodes, i.e. where each message should go to, and n_nodes is an
-            int which is the number of nodes to aggregate into.
-          edge_features: if provided, should be a [n_edges, edge_feature_dim] float
-            tensor, extra features for each edge.
+def graph_prop_once(node_states,
+                    from_idx,
+                    to_idx,
+                    message_net,
+                    aggregation_module=None,
+                    edge_features=None):
+    """One round of propagation (message passing) in a graph.
 
-        Returns:
-          aggregated_messages: an [n_nodes, edge_message_dim] float tensor, the
-            aggregated messages, one row for each node.
-        """
-        from_states = node_states[from_idx]
-        to_states = node_states[to_idx]
-        edge_inputs = [from_states, to_states]
+    Args:
+      node_states: [n_nodes, node_state_dim] float tensor, node state vectors, one
+        row for each node.
+      from_idx: [n_edges] int tensor, index of the from nodes.
+      to_idx: [n_edges] int tensor, index of the to nodes.
+      message_net: a network that maps concatenated edge inputs to message
+        vectors.
+      aggregation_module: a module that aggregates messages on edges to aggregated
+        messages for each node.  Should be a callable and can be called like the
+        following,
+        `aggregated_messages = aggregation_module(messages, to_idx, n_nodes)`,
+        where messages is [n_edges, edge_message_dim] tensor, to_idx is the index
+        of the to nodes, i.e. where each message should go to, and n_nodes is an
+        int which is the number of nodes to aggregate into.
+      edge_features: if provided, should be a [n_edges, edge_feature_dim] float
+        tensor, extra features for each edge.
 
-        if edge_features is not None:
-            edge_inputs.append(edge_features)
+    Returns:
+      aggregated_messages: an [n_nodes, edge_message_dim] float tensor, the
+        aggregated messages, one row for each node.
+    """
+    from_states = node_states[from_idx]
+    to_states = node_states[to_idx]
+    edge_inputs = [from_states, to_states]
 
-        edge_inputs = torch.cat(edge_inputs, dim=-1)
-        messages = message_net(edge_inputs)
+    if edge_features is not None:
+        edge_inputs.append(edge_features)
 
-        tensor = unsorted_segment_sum(messages, to_idx, node_states.shape[0])
-        return tensor
+    edge_inputs = torch.cat(edge_inputs, dim=-1)
+    messages = message_net(edge_inputs)
+
+    tensor = unsorted_segment_sum(messages, to_idx, node_states.shape[0])
+    return tensor
 
 def unsorted_segment_sum(data, segment_ids, num_segments):
     """
@@ -512,7 +484,7 @@ def unsorted_segment_sum(data, segment_ids, num_segments):
     # return tensor
 
     if len(segment_ids.shape) == 1:
-        s = torch.prod(torch.tensor(data.shape[1:])).long().to(segment_ids.device)
+        s = torch.prod(torch.tensor(data.shape[1:])).long().cuda()
         segment_ids = segment_ids.repeat_interleave(s).view(segment_ids.shape[0], *data.shape[1:])
 
     assert data.shape == segment_ids.shape, "data.shape and segment_ids.shape should be equal"
@@ -522,12 +494,18 @@ def unsorted_segment_sum(data, segment_ids, num_segments):
     tensor = tensor.type(data.dtype)
     return tensor
 
-def pytorch_sinkhorn_iters(log_alpha,temp=0.1,noise_factor=1.0, n_iters = 20):
+def cudavar(av, x):
+  """Adapt to CUDA or CUDA-less runs.  Annoying av arg may become
+  useful for multi-GPU settings."""
+  return x.cuda() if av.has_cuda and av.want_cuda else x
+
+def pytorch_sinkhorn_iters(av, log_alpha,temp=0.1,noise_factor=1.0, n_iters = 20):
+    noise_factor = av.NOISE_FACTOR
     batch_size = log_alpha.size()[0]
     n = log_alpha.size()[1]
     log_alpha = log_alpha.view(-1, n, n)
-    noise = pytorch_sample_gumbel([batch_size, n, n])*noise_factor
-    log_alpha = log_alpha + noise.to(log_alpha.device)
+    noise = pytorch_sample_gumbel(av,[batch_size, n, n])*noise_factor
+    log_alpha = log_alpha + noise
     log_alpha = torch.div(log_alpha,temp)
 
     for i in range(n_iters):
@@ -536,7 +514,7 @@ def pytorch_sinkhorn_iters(log_alpha,temp=0.1,noise_factor=1.0, n_iters = 20):
       log_alpha = log_alpha - (torch.logsumexp(log_alpha, dim=1, keepdim=True)).view(-1, 1, n)
     return torch.exp(log_alpha)
 
-def pytorch_sample_gumbel(shape, eps=1e-20):
+def pytorch_sample_gumbel(av,shape, eps=1e-20):
   #Sample from Gumbel(0, 1)
-  U = torch.rand(shape).float()
+  U = cudavar(av,torch.rand(shape).float())
   return -torch.log(eps - torch.log(U + eps))
