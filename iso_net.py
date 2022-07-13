@@ -4,13 +4,15 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch.nn.utils.rnn import  pad_sequence 
 from torch_geometric.data import Data, Batch
+from torch_geometric.nn import global_add_pool
+from torch_geometric.nn import MessagePassing
 
 import pytorch_lightning as pl
 import torchmetrics
 
 class ISONET(pl.LightningModule):
   def __init__(self, input_dim, node_hidden_dim, input_edge_dim, edge_hidden_dim, prop_layers = 2, node_layers = 2, edge_layers = 2,\
-    lr = 0.01, **kwargs):
+    lr = 0.001, **kwargs):
       """
       """
       super(ISONET, self).__init__()
@@ -26,6 +28,9 @@ class ISONET(pl.LightningModule):
       self.prop_layers = prop_layers
       self.MAX_EDGES = 1000
       self.lr = lr
+
+      self.train_acc = torchmetrics.Accuracy()
+      self.val_acc = torchmetrics.Accuracy()
       
       self.build_masking_utility()
       self.build_layers()
@@ -46,10 +51,10 @@ class ISONET(pl.LightningModule):
       #HACK - since I'm not storing edge sizes of each graph (only storing node sizes)
       #and no. of nodes is not equal to no. of edges
       #so a hack to obtain no of edges in each graph from available info
-      tt = unsorted_segment_sum(torch.ones(len(to_idx)).to(self.device), to_idx, len(graph_idx))
-      tt1 = unsorted_segment_sum(torch.ones(len(from_idx)).to(self.device), from_idx, len(graph_idx))
-      edge_counts = unsorted_segment_sum(tt, graph_idx, num_graphs)
-      edge_counts1 = unsorted_segment_sum(tt1, graph_idx, num_graphs)
+      tt = global_add_pool(torch.ones(len(to_idx)).to(self.device), to_idx, len(graph_idx))
+      tt1 = global_add_pool(torch.ones(len(from_idx)).to(self.device), from_idx, len(graph_idx))
+      edge_counts = global_add_pool(tt, graph_idx, num_graphs)
+      edge_counts1 = global_add_pool(tt1, graph_idx, num_graphs)
       assert(edge_counts == edge_counts1).all()
       assert(sum(edge_counts)== len(to_idx))
       return list(map(int,edge_counts.tolist()))
@@ -144,15 +149,25 @@ class ISONET(pl.LightningModule):
     predNeg = prediction[batch.y<0.5]
     losses = pairwise_ranking_loss_similarity(predPos.unsqueeze(1),predNeg.unsqueeze(1), 0.5)
       #losses = torch.nn.functional.mse_loss(target, prediction,reduction="sum")
+    self.log("train acc", self.train_acc(prediction, batch.y), prog_bar=True)
     return losses
+
+  def training_epoch_end(self, out):
+        self.log("total train acc", self.train_acc.compute(), prog_bar=True)
+        self.train_acc.reset()
 
   def validation_step(self, batch, batch_idx):
     prediction = self(batch)
+    self.log("val acc", self.val_acc(prediction, batch.y), prog_bar=True)
     return prediction
 
+  def validation_epoch_end(self, out):
+    self.log("total val acc", self.val_acc.compute(), prog_bar=True)
+    self.val_acc.reset()
+
   def configure_optimizers(self):
-        opt = torch.optim.Adam(self.parameters(), lr=self.lr)
-        return opt
+    opt = torch.optim.Adam(self.parameters(), lr=self.lr)
+    return opt
 def pairwise_ranking_loss_similarity(predPos, predNeg, margin):
     
     n_1 = predPos.shape[0]
@@ -237,7 +252,7 @@ class GraphEncoder(nn.Module):
         else:
             edge_outputs = self.MLP2(edge_features)
 
-        return node_outputs, edge_outputs
+        return node_outputs, edge_outputsdd
 
 class GraphPropLayer(pl.LightningModule):
     """Implementation of a graph propagation (message passing) layer."""
@@ -488,39 +503,9 @@ class GraphPropLayer(pl.LightningModule):
         edge_inputs = torch.cat(edge_inputs, dim=-1)
         messages = message_net(edge_inputs)
 
-        tensor = unsorted_segment_sum(messages, to_idx, node_states.shape[0])
+        tensor = global_add_pool(messages, to_idx, node_states.shape[0])
         return tensor
 
-def unsorted_segment_sum(data, segment_ids, num_segments):
-    """
-    Computes the sum along segments of a tensor. Analogous to tf.unsorted_segment_sum.
-
-    :param data: A tensor whose segments are to be summed.
-    :param segment_ids: The segment indices tensor.
-    :param num_segments: The number of segments.
-    :return: A tensor of same data type as the data argument.
-    """
-
-    assert all([i in data.shape for i in segment_ids.shape]), "segment_ids.shape should be a prefix of data.shape"
-
-    # Encourage to use the below code when a deterministic result is
-    # needed (reproducibility). However, the code below is with low efficiency.
-
-    # tensor = torch.zeros(num_segments, data.shape[1]).cuda()
-    # for index in range(num_segments):
-    #     tensor[index, :] = torch.sum(data[segment_ids == index, :], dim=0)
-    # return tensor
-
-    if len(segment_ids.shape) == 1:
-        s = torch.prod(torch.tensor(data.shape[1:])).long().to(segment_ids.device)
-        segment_ids = segment_ids.repeat_interleave(s).view(segment_ids.shape[0], *data.shape[1:])
-
-    assert data.shape == segment_ids.shape, "data.shape and segment_ids.shape should be equal"
-
-    shape = [num_segments] + list(data.shape[1:])
-    tensor = torch.zeros(*shape).cuda().scatter_add(0, segment_ids, data)
-    tensor = tensor.type(data.dtype)
-    return tensor
 
 def pytorch_sinkhorn_iters(log_alpha,temp=0.1,noise_factor=1.0, n_iters = 20):
     batch_size = log_alpha.size()[0]

@@ -1,6 +1,7 @@
 import torch
 import torch_geometric.nn as pyg_nn
 import torch.nn.functional as F
+import torch.nn as nn
 from torch.nn.utils.rnn import  pad_sequence 
 from torch_geometric.data import Data, Batch
 from torch_geometric.utils import to_dense_batch
@@ -8,9 +9,11 @@ from torch_geometric.utils import to_dense_batch
 import pytorch_lightning as pl
 import torchmetrics
 
+from gnn_convs import build_conv_model
+
 class SimGNN(pl.LightningModule):
-    def __init__(self,gnn_layers, input_dim, hidden_dim, tensor_neurons, bottle_neck_neurons, histogram = False, bins = 10, dropout=0, \
-        lr = 0.01):
+    def __init__(self,gnn_layers, input_dim, hidden_dim, tensor_neurons, bottle_neck_neurons, histogram = False, bins = 10, dropout=0, conv_type = "GIN", \
+        lr = 0.001):
         """
         """
         super(SimGNN, self).__init__()
@@ -22,6 +25,7 @@ class SimGNN(pl.LightningModule):
         self.bottle_neck_neurons = bottle_neck_neurons
         self.histogram = histogram
         self.bins = bins
+        self.conv_type = conv_type
         self.lr = lr
 
         self.mse_loss = torchmetrics.MeanSquaredError()
@@ -34,9 +38,10 @@ class SimGNN(pl.LightningModule):
         self.hidden_dim = hidden_dim
         assert(gnn_layers == len(hidden_dim))
 
+        conv_model = build_conv_model(self.conv_type, 1)
         self.convs = torch.nn.ModuleList()
         for dim in hidden_dim:
-            self.convs.append(pyg_nn.GCNConv(input_dim, dim))
+            self.convs.append(conv_model(input_dim, dim))
             input_dim = dim
         
         #Attention
@@ -85,19 +90,23 @@ class SimGNN(pl.LightningModule):
         #qgraph_sizes = torch.tensor([g.size(0) for g in query_gnode_embeds])
         #q = pad_sequence(query_gnode_embeds,batch_first=True)
         c_graphs_x = self.GNN(c_graphs)
+        
         c, _ = to_dense_batch(c_graphs_x, c_graphs.batch)
+        #print("c: ", c)
         #corpus_gnode_embeds = [g.x for g in c_graphs.to_data_list()]
         #context = torch.tanh(torch.div(torch.sum(self.attention_layer(q),dim=1).T,qgraph_sizes).T)
         context = torch.tanh(pyg_nn.global_mean_pool(self.attention_layer(q_graphs_x), q_graphs.batch))
+        #print("context: ", context)
         sigmoid_scores = torch.sigmoid(q @ context.unsqueeze(2))
         e1 = (q.permute(0,2,1)@sigmoid_scores).squeeze()
+        #print("e1: ", e1)
         #c = pad_sequence(corpus_gnode_embeds,batch_first=True)
         context = torch.tanh(pyg_nn.global_mean_pool(self.attention_layer(c_graphs_x), c_graphs.batch))
         sigmoid_scores = torch.sigmoid(c @ context.unsqueeze(2))
         e2 = (c.permute(0,2,1)@sigmoid_scores).squeeze()
         
         scores = torch.nn.functional.relu(self.ntn_a(e1,e2) +self.ntn_b(torch.cat((e1,e2),dim=-1))+self.ntn_bias.squeeze())
-
+        #print("SCORES: ", scores)
         #TODO: Figure out how to tensorize this
         if self.histogram == True:
           h = torch.histc(q@c.permute(0,2,1),bins=self.bins)
@@ -115,8 +124,7 @@ class SimGNN(pl.LightningModule):
     def training_step(self, batch, batch_idx):
 
         out = self(batch)
-        #print(out)
-        #print(out)
+        
         loss = F.mse_loss(out.squeeze(), batch.y.float())
 
         pred = (out>0.5).squeeze(1)
