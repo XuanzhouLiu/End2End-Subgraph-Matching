@@ -3,6 +3,7 @@ import numpy as np
 
 from pathlib import Path
 from sklearn.utils import shuffle
+import tqdm
 
 import torch
 from torch_geometric.data import InMemoryDataset
@@ -133,12 +134,20 @@ class SynDataset(InMemoryDataset):
         sizes = [negative, positive]
         sub_generator_list = [self.neg_subgraph_generator_list, self.pos_subgraph_generator_list]
         for y in range(2):
-            for j in range(sizes[y]):
+            if y == 0:
+                print("Generating Negative Samples")
+            else:
+                print("Generating Positive Samples")
+            for j in tqdm.tqdm(range(sizes[y])):
                 generator = random.choice(self.generator_list)
-                graph = generator.generate()
-
                 sub_generator = random.choice(sub_generator_list[y])
+
+                graph = generator.generate()
                 subgraph = sub_generator.generate(graph)
+
+                while subgraph is None:
+                    graph = generator.generate()
+                    subgraph = sub_generator.generate(graph)
 
                 data_s = from_networkx(subgraph, ["feature"])
                 data_t = from_networkx(graph, ["feature"])

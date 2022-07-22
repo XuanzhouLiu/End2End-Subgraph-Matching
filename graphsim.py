@@ -12,7 +12,7 @@ import torchmetrics
 from gnn_convs import build_conv_model
 
 class SimGNN(pl.LightningModule):
-    def __init__(self,gnn_layers, input_dim, hidden_dim, tensor_neurons, bottle_neck_neurons, histogram = False, bins = 10, dropout=0, conv_type = "GIN", \
+    def __init__(self,gnn_layers, input_dim, hidden_dim, tensor_neurons, bottle_neck_neurons, histogram = False, bins = 10, dropout=0.5, conv_type = "GIN", \
         lr = 0.001):
         """
         """

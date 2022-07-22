@@ -4,7 +4,7 @@ import numpy as np
 import networkx as nx
 import logging
 import random
-
+from networkx.algorithms import isomorphism
 
 
 class Generator(object):
@@ -32,7 +32,7 @@ class Generator(object):
     
 
 class GraphGenerator(Generator):
-    def __init__(self,sizes, size_prob=None, feat_type=None, feat_dim = 0):
+    def __init__(self,sizes, size_prob=None, feat_type=None, feat_dim = 0, **kwargs):
         super(GraphGenerator, self).__init__(sizes, size_prob)
         self.set_features(feat_type, feat_dim)
         
@@ -66,12 +66,16 @@ class ERGenerator(GraphGenerator):
     def __init__(self, sizes, p_alpha=1.3, **kwargs):
         super(ERGenerator, self).__init__(sizes, **kwargs)
         self.p_alpha = p_alpha
+        self.kwargs = kwargs
 
     def _generate_graph(self, size):
         num_nodes = size
         # p follows beta distribution with mean = log2(num_graphs) / num_graphs
         alpha = self.p_alpha
         mean = np.log2(num_nodes) / num_nodes
+        if "mean" in self.kwargs:
+            mean = self.kwargs["mean"]
+
         beta = alpha / mean - alpha
         p = np.random.beta(alpha, beta)
         graph = nx.gnp_random_graph(num_nodes, p)
@@ -124,7 +128,7 @@ class SubgraphGenerator(Generator):
 
 
 class SubTreeGenerator(SubgraphGenerator):
-    def __init__(self, sizes, size_prob=None):
+    def __init__(self, sizes, size_prob=None, **kwargs):
         super(SubTreeGenerator, self).__init__(sizes, size_prob)
         
     def generate(self, graph, size=None, **kwargs):
@@ -160,7 +164,11 @@ class SubERGenerator(SubgraphGenerator, ERGenerator):
     def __init__(self, sizes, p_alpha=1.3, **kwargs):
         SubgraphGenerator.__init__(self, sizes)
         ERGenerator.__init__(self, sizes, p_alpha, **kwargs)
-    def generate(self, graph, size=None, **kwargs):
+        self.max_time = 20
+        if "max_time" in kwargs:
+            self.max_time = kwargs["max_time"]
+
+    def generate(self, graph, size=None, iso_check = True, **kwargs):
         feat_type = self.feat_type
         if "feat_type" in kwargs:
             feat_type = kwargs["feat_type"]
@@ -170,4 +178,16 @@ class SubERGenerator(SubgraphGenerator, ERGenerator):
             feat_dim = node["feature"].size
         self.set_features(feat_type, feat_dim)
         
-        return ERGenerator.generate(self)
+        if not iso_check:
+            return ERGenerator.generate(self, size)
+
+        time = 0
+        while iso_check and time<=self.max_time:
+            subgraph = ERGenerator.generate(self, size)
+            GM = isomorphism.GraphMatcher(graph, subgraph)
+            iso_check = GM.subgraph_is_isomorphic()
+            time += 1
+
+        if time > self.max_time:
+            return None
+        return subgraph

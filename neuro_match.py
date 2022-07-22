@@ -21,8 +21,8 @@ class BaselineMLP(nn.Module):
     def __init__(self,num_layers, input_dim, hidden_dim, dropout = 0.5, skip = "learnable", conv_type = "GCN"):
         super(BaselineMLP, self).__init__()
         self.emb_model = SkipLastGNN(num_layers, input_dim, hidden_dim, hidden_dim, dropout = dropout, skip = skip, conv_type = conv_type)
-        self.mlp = nn.Sequential(nn.Linear(2 * hidden_dim, 256), nn.ReLU(),
-            nn.Linear(256, 2))
+        self.mlp = nn.Sequential(nn.Linear(2 * hidden_dim, 2 * hidden_dim), nn.ReLU(),
+            nn.Linear(2 * hidden_dim, 2))
 
     def forward(self, emb_motif, emb_motif_mod):
         pred = self.mlp(torch.cat((emb_motif, emb_motif_mod), dim=1))

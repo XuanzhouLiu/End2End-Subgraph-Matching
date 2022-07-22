@@ -12,10 +12,12 @@ import torchmetrics
 
 class ISONET(pl.LightningModule):
   def __init__(self, input_dim, node_hidden_dim, input_edge_dim, edge_hidden_dim, prop_layers = 2, node_layers = 2, edge_layers = 2,\
-    lr = 0.001, **kwargs):
+    margin = 0.1, lr = 0.001, clf_lr = 0.001, **kwargs):
       """
       """
       super(ISONET, self).__init__()
+      self.automatic_optimization = False
+
       self.config = kwargs
       self.input_dim = input_dim
       self.edge_dim = input_edge_dim
@@ -27,7 +29,9 @@ class ISONET(pl.LightningModule):
       self.edge_layers = edge_layers
       self.prop_layers = prop_layers
       self.MAX_EDGES = 1000
+      self.margin = 0.1
       self.lr = lr
+      self.clf_lr = clf_lr
 
       self.train_acc = torchmetrics.Accuracy()
       self.val_acc = torchmetrics.Accuracy()
@@ -35,6 +39,8 @@ class ISONET(pl.LightningModule):
       self.build_masking_utility()
       self.build_layers()
       self.diagnostic_mode = False
+
+      self.clf_model = nn.Sequential(nn.Linear(1, 2), nn.LogSoftmax(dim=-1))
       
   def build_masking_utility(self):
       self.max_set_size = self.MAX_EDGES
@@ -83,6 +89,10 @@ class ISONET(pl.LightningModule):
       graph_idx = torch.cat([batch.x_t_batch, len(batch.t_nodes) + batch.x_s_batch])
       return node_features, edge_features, from_idx, to_idx, graph_idx    
   
+  def criterion(self, pred, labels):
+    pred = -pred
+    pred[labels == 0] = torch.max(torch.tensor(0.0,device=pred.device), self.margin - pred)[labels == 0]
+    return torch.sum(pred)
 
   def forward(self, batch):
       """
@@ -141,25 +151,46 @@ class ISONET(pl.LightningModule):
           dim=(1,2))
       
       return scores
-    
+  
   def training_step(self, batch, batch_idx):
-    prediction = self(batch)
+    opt, clf_opt = self.optimizers()
+
+    pred = self(batch)
       #Pairwise ranking loss
-    predPos = prediction[batch.y>0.5]
-    predNeg = prediction[batch.y<0.5]
-    losses = pairwise_ranking_loss_similarity(predPos.unsqueeze(1),predNeg.unsqueeze(1), 0.5)
+    #print(pred)
+    #predPos = prediction[batch.y>0.5]
+    #predNeg = prediction[batch.y<0.5]
+    loss = self.criterion(pred, batch.y)#pairwise_ranking_loss_similarity(predPos.unsqueeze(1),predNeg.unsqueeze(1), 0.5)
       #losses = torch.nn.functional.mse_loss(target, prediction,reduction="sum")
-    self.log("train acc", self.train_acc(prediction, batch.y), prog_bar=True)
-    return losses
+
+    opt.zero_grad()
+    self.manual_backward(loss)
+    opt.step()
+
+    
+    pred = pred.detach()
+    pred = self.clf_model(pred.unsqueeze(1))
+    criterion = nn.NLLLoss()
+    clf_loss = criterion(pred, batch.y)
+
+    self.clf_model.zero_grad()
+    self.manual_backward(clf_loss)
+    clf_opt.step()
+    
+    self.log("loss", loss, prog_bar=True)
+    self.log("clf loss", clf_loss, prog_bar=True)
+    self.log("train acc", self.train_acc(pred, batch.y), prog_bar=True)
+    
 
   def training_epoch_end(self, out):
-        self.log("total train acc", self.train_acc.compute(), prog_bar=True)
-        self.train_acc.reset()
+    self.log("total train acc", self.train_acc.compute(), prog_bar=True)
+    self.train_acc.reset()
 
   def validation_step(self, batch, batch_idx):
-    prediction = self(batch)
-    self.log("val acc", self.val_acc(prediction, batch.y), prog_bar=True)
-    return prediction
+    pred = self(batch)
+    pred = self.clf_model(pred.unsqueeze(1))
+    self.log("val acc", self.val_acc(pred, batch.y), prog_bar=True)
+    
 
   def validation_epoch_end(self, out):
     self.log("total val acc", self.val_acc.compute(), prog_bar=True)
@@ -167,7 +198,9 @@ class ISONET(pl.LightningModule):
 
   def configure_optimizers(self):
     opt = torch.optim.Adam(self.parameters(), lr=self.lr)
-    return opt
+    clf_opt = torch.optim.Adam(self.clf_model.parameters(), lr=self.clf_lr)
+    return opt, clf_opt
+
 def pairwise_ranking_loss_similarity(predPos, predNeg, margin):
     
     n_1 = predPos.shape[0]
@@ -252,7 +285,34 @@ class GraphEncoder(nn.Module):
         else:
             edge_outputs = self.MLP2(edge_features)
 
-        return node_outputs, edge_outputsdd
+        return node_outputs, edge_outputs
+
+class ConvLayer(MessagePassing):
+    def __init__(self, node_input_dim, node_hidden_dim, node_output_dim, edge_input_dim, edge_hidden_dim, edge_output_dim):
+        super().__init__(aggr='sum') #  "Max" aggregation.
+        self.edge_mlp = nn.Sequential(nn.Linear(edge_input_dim + 2*input_dim, 2*edge_dim),
+                       nn.ReLU(),
+                       nn.Linear(2*edge_dim, edge_dim))
+        self.node_mlp = nn.Sequential(nn.Linear(2*input_dim+edge_dim, hidden_dim),
+                       nn.ReLU(),
+                       nn.Linear(hidden_dim, output_dim))
+    
+    def edge_update(self, x_i, x_j, edge_feat):
+        emb = torch.cat([x_i, x_j, edge_feat], dim=1)
+        edge_feat = self.edge_mlp(emb)
+        return edge_feat
+
+    def forward(self, x, edge_index, edge_feat):
+        
+        #edge_index, _ = pyg_utils.add_self_loops(edge_index, num_nodes=x.size(0))
+        edge_feat = self.edge_updater(edge_index, x=x, edge_feat=edge_feat)
+
+        out = self.propagate(edge_index, x=x, edge_feat=edge_feat)
+        
+        return out, edge_feat
+    def message(self, x_i, x_j, edge_feat):
+        tmp = torch.cat([x_i, x_j, edge_feat], dim=1)
+        return self.node_mlp(tmp)
 
 class GraphPropLayer(pl.LightningModule):
     """Implementation of a graph propagation (message passing) layer."""
